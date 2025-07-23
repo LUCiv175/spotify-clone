@@ -1,14 +1,12 @@
-version: "3.8"
+
 
 services:
   postgres:
     image: postgres:15
     container_name: spotify_postgres
     restart: always
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+    env_file:
+      - ./.env
     volumes:
       - postgres-data:/var/lib/postgresql/data
     ports:
@@ -32,10 +30,8 @@ services:
     depends_on:
       - postgres
       - redis
-    environment:
-      - ASPNETCORE_ENVIRONMENT=Development
-      - ConnectionStrings__DefaultConnection=Host=postgres;Database=spotifydb;Username=spotifyuser;Password=spotifypass
-      - Redis__ConnectionString=redis:6379
+    env_file:
+      - ./.env
 
 volumes:
   postgres-data:
