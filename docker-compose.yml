@@ -1,0 +1,37 @@
+
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: spotify_postgres
+    restart: always
+    env_file:
+      - ./.env
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  redis:
+    image: redis:7
+    container_name: spotify_redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: ./backend/webapi/webapi
+      dockerfile: Dockerfile
+    container_name: spotify_backend
+    restart: always
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - ./.env
+
+volumes:
+  postgres-data:
