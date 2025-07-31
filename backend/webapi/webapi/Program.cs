@@ -1,89 +1,47 @@
-using System.Text;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
+using DotNetEnv;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.IdentityModel.Tokens;
 using WebApi.Data;
-using DotNetEnv;
-using webapi.Interfaces;
-using webapi.Models; // Corretto il namespace
-using webapi.Services;
+using webapi.Extensions;
+using webapi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// .env
+// Carica .env
 DotNetEnv.Env.Load("../../.env");
 
-// Configura CORS
+// CORS Configuration
 var corsOrigins = Environment.GetEnvironmentVariable("CORS_ORIGINS")?.Split(',') ?? new[] { "*" };
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        policy.WithOrigins(corsOrigins)
-              .AllowAnyHeader()
-              .AllowAnyMethod()
-              .AllowCredentials();
+        policy.WithOrigins(corsOrigins).AllowAnyHeader().AllowAnyMethod().AllowCredentials();
     });
 });
 
-// Configura JwtSettings
-builder.Services.Configure<JwtSettings>(opts => {
-    opts.SecretKey = Environment.GetEnvironmentVariable("JWT_SECRET_KEY") ?? throw new InvalidOperationException("JWT_SECRET_KEY is required");
-    opts.Issuer = Environment.GetEnvironmentVariable("JWT_ISSUER") ?? throw new InvalidOperationException("JWT_ISSUER is required");
-    opts.Audience = Environment.GetEnvironmentVariable("JWT_AUDIENCE") ?? throw new InvalidOperationException("JWT_AUDIENCE is required");
-    opts.ExpiresInMinutes = int.Parse(Environment.GetEnvironmentVariable("JWT_EXPIRES_IN_MINUTES") ?? "60");
-    opts.RefreshExpiresInDays = int.Parse(Environment.GetEnvironmentVariable("JWT_REFRESH_EXPIRES_IN_DAYS") ?? "7");
-});
+// Add services using extensions
+builder.Services.AddDatabase();
+builder.Services.AddIdentityServices();
+builder.Services.AddJwtAuthentication();
+builder.Services.AddAuthorizationPolicies();
+builder.Services.AddApplicationServices();
 
-// Usa la connection string corretta dal docker-compose
-var connectionString = Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection") 
-    ?? throw new InvalidOperationException("Database connection string is required");
-
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseNpgsql(connectionString));
-
-builder.Services.AddIdentity<ApplicationUser, IdentityRole>(options =>
-{
-    options.Password.RequireDigit = true;
-    options.Password.RequiredLength = 8;
-    options.Password.RequireNonAlphanumeric = false;
-    options.User.RequireUniqueEmail = true;
-})
-.AddEntityFrameworkStores<AppDbContext>()
-.AddDefaultTokenProviders();
-
-builder.Services.AddScoped<IAuthService, AuthService>();
-
-var jwtSecretKey = Environment.GetEnvironmentVariable("JWT_SECRET_KEY") 
-    ?? throw new InvalidOperationException("JWT_SECRET_KEY is required");
-
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options => {
-        var key = Encoding.UTF8.GetBytes(jwtSecretKey);
-        options.TokenValidationParameters = new TokenValidationParameters {
-            ValidateIssuer = true,
-            ValidateAudience = true,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            ValidIssuer = Environment.GetEnvironmentVariable("JWT_ISSUER"),
-            ValidAudience = Environment.GetEnvironmentVariable("JWT_AUDIENCE"),
-            IssuerSigningKey = new SymmetricSecurityKey(key),
-            ClockSkew = TimeSpan.Zero
-        };
-    });
-
-builder.Services.AddAuthorization();
+// Controllers and API
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerDocumentation();
 
 var app = builder.Build();
 
+// Configure pipeline
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseSwaggerUI(c =>
+    {
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "Spotify Clone API V1");
+    });
 }
 
 app.UseHttpsRedirection();
@@ -92,31 +50,74 @@ app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
 
-// Applica automaticamente le migration all'avvio con retry
-using (var scope = app.Services.CreateScope())
+// Database Migration and Seeding
+await using (var scope = app.Services.CreateAsyncScope())
 {
-    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
-    
-    var maxRetries = 10;
-    var delay = TimeSpan.FromSeconds(5);
-    
-    for (int i = 0; i < maxRetries; i++)
+    var services = scope.ServiceProvider;
+    var logger = services.GetRequiredService<ILogger<Program>>();
+
+    try
     {
-        try
-        {
-            logger.LogInformation("Attempting to apply database migrations... (Attempt {Attempt}/{MaxRetries})", i + 1, maxRetries);
-            db.Database.Migrate();
-            logger.LogInformation("Database migrations applied successfully.");
-            break;
-        }
-        catch (Exception ex) when (i < maxRetries - 1)
-        {
-            logger.LogWarning("Failed to apply migrations (attempt {Attempt}/{MaxRetries}): {Error}. Retrying in {Delay} seconds...", 
-                i + 1, maxRetries, ex.Message, delay.TotalSeconds);
-            await Task.Delay(delay);
-        }
+        var context = services.GetRequiredService<AppDbContext>();
+        await context.Database.MigrateAsync();
+        logger.LogInformation("Database migrations applied successfully");
+
+        await SeedDataAsync(services, logger);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "An error occurred while migrating or seeding the database");
+        throw;
     }
 }
 
 app.Run();
+
+// Seed method
+static async Task SeedDataAsync(IServiceProvider services, ILogger logger)
+{
+    var roleManager = services.GetRequiredService<RoleManager<IdentityRole>>();
+    var userManager = services.GetRequiredService<UserManager<ApplicationUser>>();
+
+    // Seed roles
+    foreach (var role in AppRoles.All)
+    {
+        if (!await roleManager.RoleExistsAsync(role))
+        {
+            await roleManager.CreateAsync(new IdentityRole(role));
+            logger.LogInformation("Role {Role} created", role);
+        }
+    }
+
+    // Seed admin user
+    var adminEmail = "admin@spotifyclone.com";
+    var adminUser = await userManager.FindByEmailAsync(adminEmail);
+
+    if (adminUser == null)
+    {
+        adminUser = new ApplicationUser
+        {
+            UserName = "admin",
+            Email = adminEmail,
+            Name = "Admin",
+            Surname = "User",
+            EmailConfirmed = true,
+            CreatedAt = DateTime.UtcNow,
+        };
+
+        var result = await userManager.CreateAsync(adminUser, "Admin123!");
+
+        if (result.Succeeded)
+        {
+            await userManager.AddToRolesAsync(adminUser, AppRoles.All);
+            logger.LogInformation("Admin user created successfully");
+        }
+        else
+        {
+            logger.LogError(
+                "Failed to create admin user: {Errors}",
+                string.Join(", ", result.Errors.Select(e => e.Description))
+            );
+        }
+    }
+}
