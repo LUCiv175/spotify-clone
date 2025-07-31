@@ -9,7 +9,8 @@ namespace WebApi.Data
         public AppDbContext CreateDbContext(string[] args)
         {
             // Carica .env a design time (solo per dotnet ef)
-            Env.Load("../../../.env");
+            var envPath = Path.Combine(AppContext.BaseDirectory, "../../../.env");
+            Env.Load(envPath);
 
             var connectionString = Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection")
                 ?? throw new InvalidOperationException("Connection string not found");
