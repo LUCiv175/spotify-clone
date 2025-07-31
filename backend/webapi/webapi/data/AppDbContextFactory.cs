@@ -1,6 +1,6 @@
+using DotNetEnv;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
-using DotNetEnv;
 
 namespace WebApi.Data
 {
@@ -8,11 +8,11 @@ namespace WebApi.Data
     {
         public AppDbContext CreateDbContext(string[] args)
         {
-            // Carica .env a design time (solo per dotnet ef)
-            var envPath = Path.Combine(AppContext.BaseDirectory, "../../../.env");
-            Env.Load(envPath);
+            // Load environment variables from .env file
+            Env.Load("../../../.env");
 
-            var connectionString = Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection")
+            var connectionString =
+                Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection")
                 ?? throw new InvalidOperationException("Connection string not found");
 
             var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>();

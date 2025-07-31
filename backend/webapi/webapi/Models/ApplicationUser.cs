@@ -12,17 +12,18 @@ public class ApplicationUser : IdentityUser
     public string Surname { get; set; } = string.Empty;
 
     public DateTime? Birthdate { get; set; }
-
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-
     public DateTime? UpdatedAt { get; set; }
 
-    // Proprietà per artisti
+    [MaxLength(1000)]
     public string? ArtistBio { get; set; }
+
+    [MaxLength(500)]
     public string? ArtistProfileImage { get; set; }
+
     public bool IsVerifiedArtist { get; set; } = false;
 
-    // Navigazione
+    public virtual ICollection<RefreshToken> RefreshTokens { get; set; } = new List<RefreshToken>();
     public virtual ICollection<Song> Songs { get; set; } = new List<Song>();
     public virtual ICollection<Playlist> Playlists { get; set; } = new List<Playlist>();
 }

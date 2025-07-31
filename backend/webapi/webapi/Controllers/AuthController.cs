@@ -7,105 +7,139 @@ namespace webapi.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
-public class AuthController : ControllerBase
+public class AuthController(IAuthService authService, IGoogleAuthService googleAuthService)
+    : ControllerBase
 {
-    private readonly IAuthService _authService;
-    private readonly IGoogleAuthService _googleAuthService;
-    private readonly ILogger<AuthController> _logger;
-
-    public AuthController(
-        IAuthService authService,
-        IGoogleAuthService googleAuthService,
-        ILogger<AuthController> logger
-    )
-    {
-        _authService = authService;
-        _googleAuthService = googleAuthService;
-        _logger = logger;
-    }
-
-    /// <summary>
-    /// User login with email/password
-    /// </summary>
     [HttpPost("login")]
-    [ProducesResponseType(typeof(AuthResponseDto), 200)]
-    [ProducesResponseType(400)]
-    public async Task<IActionResult> Login(LoginDto model)
+    public async Task<ActionResult<AuthResponseDto>> Login(LoginDto model)
     {
-        if (!ModelState.IsValid)
-            return BadRequest(ModelState);
-
         try
         {
-            var result = await _authService.LoginAsync(model);
+            var ipAddress = GetIpAddress();
+            var result = await authService.LoginAsync(model, ipAddress);
+            SetRefreshTokenCookie(result.RefreshToken);
             return Ok(result);
         }
-        catch (ArgumentException ex)
+        catch (UnauthorizedAccessException ex)
+        {
+            return Unauthorized(new { error = ex.Message });
+        }
+        catch (Exception ex)
         {
             return BadRequest(new { error = ex.Message });
         }
-        catch (UnauthorizedAccessException ex)
-        {
-            return Unauthorized(new { error = ex.Message });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Unexpected error during login for {Email}", model.Email);
-            return StatusCode(500, new { error = "An unexpected error occurred" });
-        }
     }
 
-    /// <summary>
-    /// User login with Google
-    /// </summary>
-    [HttpPost("google-login")]
-    [ProducesResponseType(typeof(AuthResponseDto), 200)]
-    [ProducesResponseType(400)]
-    public async Task<IActionResult> GoogleLogin(GoogleLoginDto model)
-    {
-        if (!ModelState.IsValid)
-            return BadRequest(ModelState);
-
-        try
-        {
-            var result = await _googleAuthService.LoginWithGoogleAsync(model);
-            return Ok(result);
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            return Unauthorized(new { error = ex.Message });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Unexpected error during Google login");
-            return StatusCode(500, new { error = "An unexpected error occurred" });
-        }
-    }
-
-    /// <summary>
-    /// User registration
-    /// </summary>
     [HttpPost("register")]
-    [ProducesResponseType(typeof(AuthResponseDto), 200)]
-    [ProducesResponseType(400)]
-    public async Task<IActionResult> Register(RegisterDto model)
+    public async Task<ActionResult<AuthResponseDto>> Register(RegisterDto model)
     {
-        if (!ModelState.IsValid)
-            return BadRequest(ModelState);
-
         try
         {
-            var result = await _authService.RegisterAsync(model);
+            var ipAddress = GetIpAddress();
+            var result = await authService.RegisterAsync(model, ipAddress);
+            SetRefreshTokenCookie(result.RefreshToken);
             return Ok(result);
         }
         catch (InvalidOperationException ex)
         {
             return BadRequest(new { error = ex.Message });
         }
-        catch (Exception ex)
+    }
+
+    [HttpPost("google-login")]
+    public async Task<ActionResult<AuthResponseDto>> GoogleLogin(GoogleLoginDto model)
+    {
+        try
         {
-            _logger.LogError(ex, "Unexpected error during registration for {Email}", model.Email);
-            return StatusCode(500, new { error = "An unexpected error occurred" });
+            var result = await googleAuthService.LoginWithGoogleAsync(model);
+            SetRefreshTokenCookie(result.RefreshToken);
+            return Ok(result);
         }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Unauthorized(new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Refresh user token
+    /// </summary>
+    [HttpPost("refresh-token")]
+    public async Task<ActionResult<AuthResponseDto>> RefreshToken()
+    {
+        try
+        {
+            var refreshToken = Request.Cookies["refreshToken"] ?? "";
+            var ipAddress = GetIpAddress();
+
+            var result = await authService.RefreshTokenAsync(refreshToken, ipAddress);
+            SetRefreshTokenCookie(result.RefreshToken);
+
+            return Ok(result);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Unauthorized(new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Revoke user token
+    /// </summary>
+    [HttpPost("revoke-token")]
+    [Authorize]
+    public async Task<IActionResult> RevokeToken(RefreshTokenDto? model = null)
+    {
+        try
+        {
+            var refreshToken = model?.RefreshToken ?? Request.Cookies["refreshToken"] ?? "";
+            var ipAddress = GetIpAddress();
+
+            await authService.RevokeTokenAsync(refreshToken, ipAddress);
+            return Ok(new { message = "Token revoked successfully" });
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Unauthorized(new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Get user profile
+    /// </summary>
+    [HttpGet("profile")]
+    [Authorize]
+    public IActionResult GetProfile()
+    {
+        return Ok(
+            new
+            {
+                UserId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value,
+                Email = User.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value,
+                Roles = User.FindAll(System.Security.Claims.ClaimTypes.Role).Select(c => c.Value),
+            }
+        );
+    }
+
+    // 🔧 Helper Methods
+
+    private void SetRefreshTokenCookie(string refreshToken)
+    {
+        var cookieOptions = new CookieOptions
+        {
+            HttpOnly = true,
+            Expires = DateTime.UtcNow.AddDays(7),
+            Secure = true, // Solo HTTPS in produzione
+            SameSite = SameSiteMode.Strict,
+        };
+
+        Response.Cookies.Append("refreshToken", refreshToken, cookieOptions);
+    }
+
+    private string GetIpAddress()
+    {
+        return Request.Headers.ContainsKey("X-Forwarded-For")
+            ? Request.Headers["X-Forwarded-For"].ToString().Split(',')[0].Trim()
+            : HttpContext.Connection.RemoteIpAddress?.ToString() ?? "";
     }
 }

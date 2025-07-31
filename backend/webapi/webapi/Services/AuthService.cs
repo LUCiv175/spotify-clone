@@ -1,79 +1,47 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
+using WebApi.Data;
 using webapi.DTOs;
 using webapi.Interfaces;
 using webapi.Models;
 
 namespace webapi.Services;
 
-public class AuthService : IAuthService
+public class AuthService(
+    UserManager<ApplicationUser> userManager,
+    AppDbContext context,
+    IOptions<JwtSettings> jwtOptions,
+    ILogger<AuthService> logger
+) : IAuthService
 {
-    private readonly UserManager<ApplicationUser> _userManager;
-    private readonly ILogger<AuthService> _logger;
-    private readonly JwtSettings _jwtSettings;
+    private readonly JwtSettings _jwtSettings = jwtOptions.Value;
 
-    public AuthService(
-        UserManager<ApplicationUser> userManager,
-        ILogger<AuthService> logger,
-        IOptions<JwtSettings> jwtOptions
-    )
+    public async Task<AuthResponseDto> LoginAsync(LoginDto model, string? ipAddress = null)
     {
-        _userManager = userManager;
-        _logger = logger;
-        _jwtSettings = jwtOptions.Value;
+        var user =
+            await userManager.FindByEmailAsync(model.Email)
+            ?? throw new UnauthorizedAccessException("Invalid credentials");
+
+        if (!await userManager.CheckPasswordAsync(user, model.Password))
+            throw new UnauthorizedAccessException("Invalid credentials");
+
+        logger.LogInformation("User {Email} logged in successfully", model.Email);
+        return await GenerateTokenAsync(user, ipAddress);
     }
 
-    public async Task<AuthResponseDto> LoginAsync(LoginDto model)
+    public async Task<AuthResponseDto> RegisterAsync(RegisterDto model, string? ipAddress = null)
     {
-        if (string.IsNullOrWhiteSpace(model.Email) || string.IsNullOrWhiteSpace(model.Password))
-        {
-            _logger.LogWarning("Login attempt with empty credentials");
-            throw new ArgumentException("Email and password are required");
-        }
+        if (await userManager.FindByEmailAsync(model.Email) != null)
+            throw new InvalidOperationException("User already exists");
 
-        var user = await _userManager.FindByEmailAsync(model.Email);
-        if (user == null)
-        {
-            _logger.LogWarning("Login attempt for non-existent user: {Email}", model.Email);
-            throw new UnauthorizedAccessException("Invalid credentials");
-        }
-
-        if (!await _userManager.CheckPasswordAsync(user, model.Password))
-        {
-            _logger.LogWarning("Failed login attempt for user: {Email}", model.Email);
-            throw new UnauthorizedAccessException("Invalid credentials");
-        }
-
-        _logger.LogInformation("Successful login for user: {Email}", model.Email);
-        return await GenerateTokenAsync(user);
-    }
-
-    public async Task<AuthResponseDto> RegisterAsync(RegisterDto model)
-    {
-        // Validazioni
-        if (await _userManager.FindByEmailAsync(model.Email) != null)
-        {
-            throw new InvalidOperationException("User with this email already exists");
-        }
-
-        if (await _userManager.FindByNameAsync(model.Username) != null)
-        {
-            throw new InvalidOperationException("Username is already taken");
-        }
-
-        // Validazione età per artisti
-        if (model.RegisterAsArtist && model.Birthdate.HasValue)
-        {
-            var age = DateTime.UtcNow.Year - model.Birthdate.Value.Year;
-            if (age < 16)
-            {
-                throw new InvalidOperationException("Artists must be at least 16 years old");
-            }
-        }
+        if (await userManager.FindByNameAsync(model.Username) != null)
+            throw new InvalidOperationException("Username taken");
 
         var user = new ApplicationUser
         {
@@ -82,51 +50,89 @@ public class AuthService : IAuthService
             Name = model.Name,
             Surname = model.Surname,
             Birthdate = model.Birthdate,
-            CreatedAt = DateTime.UtcNow,
             ArtistBio = model.RegisterAsArtist ? model.ArtistBio : null,
-            IsVerifiedArtist = false,
         };
 
-        var result = await _userManager.CreateAsync(user, model.Password);
-
+        var result = await userManager.CreateAsync(user, model.Password);
         if (!result.Succeeded)
-        {
-            var errors = string.Join("; ", result.Errors.Select(e => e.Description));
-            _logger.LogWarning("Registration failed for {Email}: {Errors}", model.Email, errors);
-            throw new InvalidOperationException($"Registration failed: {errors}");
-        }
+            throw new InvalidOperationException(
+                string.Join("; ", result.Errors.Select(e => e.Description))
+            );
 
-        // Assegna ruoli
-        var rolesToAssign = new List<string> { AppRoles.User };
+        // Assign roles
+        var roles = new List<string> { AppRoles.User };
         if (model.RegisterAsArtist)
-        {
-            rolesToAssign.Add(AppRoles.Artist);
-        }
+            roles.Add(AppRoles.Artist);
 
-        foreach (var role in rolesToAssign)
-        {
-            await _userManager.AddToRoleAsync(user, role);
-        }
+        foreach (var role in roles)
+            await userManager.AddToRoleAsync(user, role);
 
-        _logger.LogInformation(
-            "User registered successfully: {Email} with roles: {Roles}",
+        logger.LogInformation(
+            "User {Email} registered successfully with roles: {Roles}",
             model.Email,
-            string.Join(", ", rolesToAssign)
+            string.Join(", ", roles)
         );
 
-        return await GenerateTokenAsync(user);
+        return await GenerateTokenAsync(user, ipAddress);
     }
 
-    // Rendi pubblico il metodo GenerateTokenAsync
-    public async Task<AuthResponseDto> GenerateTokenAsync(ApplicationUser user)
+    public async Task<AuthResponseDto> RefreshTokenAsync(
+        string refreshToken,
+        string? ipAddress = null
+    )
     {
-        var authClaims = new List<Claim>
+        var token = await GetRefreshTokenAsync(refreshToken);
+        var user = token.User;
+
+        // Revoke current token and generate new one
+        await RevokeRefreshTokenAsync(token, ipAddress, "Replaced by new token");
+        var newRefreshToken = await GenerateRefreshTokenAsync(user.Id, ipAddress);
+
+        user.RefreshTokens.Add(newRefreshToken);
+        await RemoveOldRefreshTokensAsync(user);
+        await context.SaveChangesAsync();
+
+        logger.LogInformation("Refresh token renewed for user {UserId}", user.Id);
+        return await GenerateJwtTokenAsync(user, newRefreshToken.Token);
+    }
+
+    public async Task RevokeTokenAsync(string refreshToken, string? ipAddress = null)
+    {
+        var token = await GetRefreshTokenAsync(refreshToken);
+        await RevokeRefreshTokenAsync(token, ipAddress, "Revoked by user");
+        await context.SaveChangesAsync();
+
+        logger.LogInformation("Refresh token revoked for user {UserId}", token.UserId);
+    }
+
+    public async Task<AuthResponseDto> GenerateTokenAsync(
+        ApplicationUser user,
+        string? ipAddress = null
+    )
+    {
+        var refreshToken = await GenerateRefreshTokenAsync(user.Id, ipAddress);
+        user.RefreshTokens.Add(refreshToken);
+
+        await RemoveOldRefreshTokensAsync(user);
+        await context.SaveChangesAsync();
+
+        return await GenerateJwtTokenAsync(user, refreshToken.Token);
+    }
+
+    // 🔧 Private Methods
+
+    private async Task<AuthResponseDto> GenerateJwtTokenAsync(
+        ApplicationUser user,
+        string refreshToken
+    )
+    {
+        var roles = await userManager.GetRolesAsync(user);
+
+        var claims = new List<Claim>
         {
             new(ClaimTypes.NameIdentifier, user.Id),
-            new(ClaimTypes.Name, user.UserName ?? ""),
-            new(ClaimTypes.Email, user.Email ?? ""),
-            new(ClaimTypes.GivenName, user.Name),
-            new(ClaimTypes.Surname, user.Surname),
+            new(ClaimTypes.Email, user.Email!),
+            new(ClaimTypes.Name, user.UserName!),
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
             new(
                 JwtRegisteredClaimNames.Iat,
@@ -135,49 +141,107 @@ public class AuthService : IAuthService
             ),
         };
 
-        // Aggiungi ruoli
-        var userRoles = await _userManager.GetRolesAsync(user);
-        authClaims.AddRange(userRoles.Select(role => new Claim(ClaimTypes.Role, role)));
+        claims.AddRange(roles.Select(role => new Claim(ClaimTypes.Role, role)));
 
-        // Claims personalizzati per artisti
-        if (userRoles.Contains(AppRoles.Artist))
-        {
-            authClaims.Add(
-                new Claim("is_verified_artist", user.IsVerifiedArtist.ToString().ToLower())
-            );
-        }
+        if (roles.Contains(AppRoles.Artist))
+            claims.Add(new Claim("is_verified_artist", user.IsVerifiedArtist.ToString().ToLower()));
 
         var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtSettings.SecretKey));
-        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
-
         var expires = DateTime.UtcNow.AddMinutes(_jwtSettings.ExpiresInMinutes);
+        var refreshExpires = DateTime.UtcNow.AddDays(7); // 7 giorni per refresh token
 
         var token = new JwtSecurityToken(
             issuer: _jwtSettings.Issuer,
             audience: _jwtSettings.Audience,
-            claims: authClaims,
+            claims: claims,
             expires: expires,
-            signingCredentials: creds
+            signingCredentials: new SigningCredentials(key, SecurityAlgorithms.HmacSha256)
         );
 
-        return new AuthResponseDto
+        var userProfile = new UserProfileDto
+        {
+            Id = user.Id,
+            Username = user.UserName!,
+            Email = user.Email!,
+            Name = user.Name,
+            Surname = user.Surname,
+            Birthdate = user.Birthdate,
+            Roles = roles.ToArray(),
+            IsVerifiedArtist = user.IsVerifiedArtist,
+            ArtistBio = user.ArtistBio,
+            CreatedAt = user.CreatedAt,
+        };
+
+        var authResponse = new AuthResponseDto
         {
             Token = new JwtSecurityTokenHandler().WriteToken(token),
-            RefreshToken = "", // TODO: implementare refresh token
+            RefreshToken = refreshToken,
             Expires = expires,
-            User = new UserProfileDto
-            {
-                Id = user.Id,
-                Username = user.UserName ?? "",
-                Email = user.Email ?? "",
-                Name = user.Name,
-                Surname = user.Surname,
-                Birthdate = user.Birthdate,
-                Roles = userRoles.ToArray(),
-                IsVerifiedArtist = user.IsVerifiedArtist,
-                ArtistBio = user.ArtistBio,
-                CreatedAt = user.CreatedAt,
-            },
+            User = userProfile,
         };
+
+        return authResponse;
+    }
+
+    private async Task<RefreshToken> GenerateRefreshTokenAsync(string userId, string? ipAddress)
+    {
+        var randomBytes = new byte[64];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(randomBytes);
+
+        var refreshToken = new RefreshToken
+        {
+            Token = Convert.ToBase64String(randomBytes),
+            Expires = DateTime.UtcNow.AddDays(7), // 7 giorni di validità
+            Created = DateTime.UtcNow,
+            CreatedByIp = ipAddress,
+            UserId = userId,
+        };
+
+        // Assicurati che il token sia unico
+        var tokenExists = await context.RefreshTokens.AnyAsync(x => x.Token == refreshToken.Token);
+        if (tokenExists)
+            return await GenerateRefreshTokenAsync(userId, ipAddress); // Ricorsione per generarne uno nuovo
+
+        return refreshToken;
+    }
+
+    private async Task<RefreshToken> GetRefreshTokenAsync(string token)
+    {
+        var refreshToken = await context
+            .RefreshTokens.Include(x => x.User)
+            .SingleOrDefaultAsync(x => x.Token == token);
+
+        return refreshToken?.IsActive == true
+            ? refreshToken
+            : throw new UnauthorizedAccessException("Invalid or expired refresh token");
+    }
+
+    private async Task RevokeRefreshTokenAsync(
+        RefreshToken token,
+        string? ipAddress,
+        string? reason = null
+    )
+    {
+        token.Revoked = DateTime.UtcNow;
+        token.RevokedByIp = ipAddress;
+        token.ReplacedByToken = reason;
+
+        context.RefreshTokens.Update(token);
+        await Task.CompletedTask;
+    }
+
+    private async Task RemoveOldRefreshTokensAsync(ApplicationUser user)
+    {
+        // Rimuovi refresh token scaduti e revocati più vecchi di 7 giorni
+        var oldTokens = user
+            .RefreshTokens.Where(x => !x.IsActive && x.Created.AddDays(7) <= DateTime.UtcNow)
+            .ToList();
+
+        if (oldTokens.Any())
+        {
+            context.RefreshTokens.RemoveRange(oldTokens);
+            await Task.CompletedTask;
+        }
     }
 }
